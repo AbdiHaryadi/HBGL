@@ -1,4 +1,5 @@
 import os
+import pandas as pd
 import json
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -8,7 +9,8 @@ import re
 WoS Reference: https://github.com/kk7nc/HDLTex
 """
 
-FILE_DIR = 'Meta-data/Data.txt'
+FILE_DIR = 'Meta-data/Data.xlsx'
+SHEET = "abstracts"
 total_len = []
 np.random.seed(7)
 
@@ -65,17 +67,19 @@ stats = {'Root': {'CS': 0, 'Medical': 0, 'Civil': 0, 'ECE': 0, 'biochemistry': 0
 # 5-17 ['Digestive Health', 'Outdoor Health']
 
 def get_data_from_meta():
-    f = open(FILE_DIR, 'r')
-    origin_txt = f.readlines()
-    f.close()
     data = []
     label_check = {}
-    for line in origin_txt[1:]:
-        line = line.rstrip('\n')
-        line = line.split('\t')
-        assert len(line) == 7
-        sample_label = [line[3].rstrip().lstrip(), line[4].rstrip().lstrip()]
-        code = str(line[0]) + '-' + str(line[1])
+
+    df = pd.read_excel(FILE_DIR, SHEET)
+    for _, row in df.iterrows():
+        y1 = row["Y1"]
+        y2 = row["Y2"]
+        domain = row["Domain"]
+        area = row["area"]
+        doc = row["Abstract"]
+
+        sample_label = [domain.rstrip().lstrip(), area.rstrip().lstrip()]
+        code = str(y1) + '-' + str(y2)
 
         if code in label_check.keys():
             if sample_label[1] not in label_check[code]:
@@ -98,7 +102,6 @@ def get_data_from_meta():
         #     sample_label[1] = 'Smart Material'
         # if sample_label[1] == 'Outdoor Health':
         #     sample_label[1] = ''
-        doc = line[6]
         doc = clean_str(doc)
         sample_text = doc
         total_len.append(len(sample_text))

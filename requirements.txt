@@ -1,7 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+
 numpy
 boto3
 requests
 tqdm
 wandb
 sentencepiece
-transformers==2.10.0
+transformers
+scikit-learn
+torch
+pandas
+openpyxl
