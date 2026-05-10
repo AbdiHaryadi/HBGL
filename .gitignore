@@ -1,3 +1,9 @@
 venv/
 venv38/
 **/__pycache__
+wandb/
+.cache/
+models/
+after.pt
+before.pt
+tea_debug.log
