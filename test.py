@@ -17,19 +17,13 @@ import random
 import pickle
 
 from s2s_ft.modeling_decoding import BertForSeq2SeqDecoder, BertConfig
-from transformers.tokenization_bert import whitespace_tokenize
 import s2s_ft.s2s_loader as seq2seq_loader
-from s2s_ft.utils import load_and_cache_examples
+from s2s_ft.utils import TrainingExample, load_and_cache_examples
 from transformers import BertTokenizer
 
 TOKENIZER_CLASSES = {
     'bert': BertTokenizer,
 }
-
-
-class WhitespaceTokenizer(object):
-    def tokenize(self, text):
-        return whitespace_tokenize(text)
 
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -214,7 +208,8 @@ def main(flags=None):
             length_penalty=args.length_penalty, eos_id=eos_word_ids, sos_id=sos_word_id,
             forbid_duplicate_ngrams=args.forbid_duplicate_ngrams, forbid_ignore_set=forbid_ignore_set,
             ngram_size=args.ngram_size, min_len=args.min_len, mode=args.mode,
-            max_position_embeddings=args.max_seq_length, pos_shift=args.pos_shift,
+            pos_shift=args.pos_shift,
+            ignore_mismatched_sizes=True  # Remember that the model changed because of label embedding?
         )
 
         if args.softmax_label_only and args.add_vocab_file:
@@ -234,9 +229,11 @@ def main(flags=None):
                             hier_labels[i] |=  set(l)
                     else:
                         hier_labels = [set(i) for i in json.loads(line)['tgt']]
+                assert hier_labels is not None
                 hier_labels = [tokenizer.convert_tokens_to_ids(list([j.lower() for j in i])) for i in hier_labels]
 
                 def to_multi_hot(label):
+                    assert isinstance(model.config, BertConfig)
                     _label = torch.zeros(model.config.vocab_size)
                     for i in label:
                         _label[i] = 1
@@ -247,7 +244,7 @@ def main(flags=None):
 
         if args.fp16:
             model.half()
-        model.to(device)
+        model.to(device) # type: ignore # no idea why this is happening
         if n_gpu > 1:
             model = torch.nn.DataParallel(model)
 
@@ -271,6 +268,7 @@ def main(flags=None):
 
         input_lines = []
         for line in to_pred:
+            assert isinstance(line, TrainingExample)
             input_lines.append(tokenizer.convert_ids_to_tokens(line.source_ids)[:max_src_length])
         if args.subset > 0:
             logger.info("Decoding subset: %d", args.subset)

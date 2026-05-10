@@ -10,13 +10,7 @@ import tqdm
 import array
 import collections
 import torch.utils.data
-from transformers.file_utils import WEIGHTS_NAME
 import torch.nn.functional as F
-
-try:
-    import lmdb
-except:
-    pass
 
 OPTIM_NAME = "optimizer.bin"
 
@@ -257,27 +251,7 @@ def batch_list_to_batch_tensors(batch):
 
 
 def get_max_epoch_model(output_dir):
-    fn_model_list = glob.glob(os.path.join(output_dir, "ckpt-*/%s" % WEIGHTS_NAME))
-    fn_optim_list = glob.glob(os.path.join(output_dir, "ckpt-*/%s" % OPTIM_NAME))
-    if (not fn_model_list) or (not fn_optim_list):
-        return None
-    both_set = set([int(os.path.dirname(fn).split('-')[-1]) for fn in fn_model_list]
-                   ) & set([int(os.path.dirname(fn).split('-')[-1]) for fn in fn_optim_list])
-    if both_set:
-        return max(both_set)
-    else:
-        return None
-
-
-def get_checkpoint_state_dict(output_dir, ckpt):
-    model_recover_checkpoint = os.path.join(output_dir, "ckpt-%d" % ckpt, WEIGHTS_NAME)
-    logger.info(" ** Recover model checkpoint in %s ** ", model_recover_checkpoint)
-    model_state_dict = torch.load(model_recover_checkpoint, map_location='cpu')
-    optimizer_recover_checkpoint = os.path.join(output_dir, "ckpt-%d" % ckpt, OPTIM_NAME)
-    checkpoint_state_dict = torch.load(optimizer_recover_checkpoint, map_location='cpu')
-    checkpoint_state_dict['model'] = model_state_dict
-    return checkpoint_state_dict
-
+    return None
 
 def report_length(length_counter, total_count):
     max_len = max(length_counter.keys())
@@ -294,39 +268,13 @@ def report_length(length_counter, total_count):
         a += 16
 
 
-def serialize_str(x):
-    return u"{}".format(x).encode('ascii')
-
-
-def serialize_array(x, dtype):
-    data = array.array(dtype)
-    data.fromlist(x)
-    return data.tobytes()
-
-def write_to_lmdb(db, key, value):
-    success = False
-    while not success:
-        txn = db.begin(write=True)
-        try:
-            txn.put(key, value)
-            txn.commit()
-            success = True
-        except lmdb.MapFullError:
-            txn.abort()
-            # double the map_size
-            curr_limit = db.info()['map_size']
-            new_limit = curr_limit*2
-            print('>>> Doubling LMDB map size to %sMB ...' %
-                  (new_limit >> 20,))
-            db.set_mapsize(new_limit)  # double it
-
-
 def deserialize_str(x):
     return x.decode('ascii')
 
 
 class DocDB(object):
     def __init__(self, db_path):
+        raise NotImplementedError
         self.db_path = db_path
         self.env = lmdb.open(db_path, readonly=True, lock=False, readahead=False, meminit=False)
         with self.env.begin(write=False) as txn:
@@ -335,11 +283,13 @@ class DocDB(object):
             self.dtype = deserialize_str(txn.get(b'__dtype__'))
 
     def _deserialize_array(self, x):
+        raise NotImplementedError
         data = array.array(self.dtype)
         data.frombytes(x)
         return data.tolist()
 
     def __getitem__(self, doc_id):
+        raise NotImplementedError
         with self.env.begin(write=False) as txn:
             # example = {
             #     "source_ids": self._deserialize_array(txn.get(b"src_ids_%d" % doc_id)), 
@@ -353,6 +303,7 @@ class DocDB(object):
         return example
 
     def __len__(self):
+        raise NotImplementedError
         return self.size
 
 
@@ -399,12 +350,16 @@ def load_and_cache_examples_fast(
         with Pool() as p:
             features = p.starmap(_fast_process_one, [(i, tokenizer) for i in examples])
 
+        new_features = []
         for i, f in enumerate(features):
-            features[i] = TrainingExample(
+            new_features_i = TrainingExample(
                 source_ids=f['source_ids'],
                 target_ids=f['target_ids'] if not eval_mode else [],
                 example_id=i,
             )
+            new_features.append(new_features_i)
+
+        features = new_features
 
         b = time.time() - b
         logger.info("End took %s s", b)
@@ -432,7 +387,7 @@ def load_and_cache_examples(
 
     if cached_features_file is not None and os.path.isfile(cached_features_file):
         logger.info("Loading features from cached file %s", cached_features_file)
-        features = torch.load(cached_features_file)
+        features = torch.load(cached_features_file, weights_only=False)
     elif cached_features_file is not None and os.path.isdir(cached_features_file) \
         and os.path.exists(os.path.join(cached_features_file, 'lock.mdb')):
         logger.info("Loading features from cached LMDB %s", cached_features_file)
@@ -492,27 +447,8 @@ def load_and_cache_examples(
         report_length(tlc, total_count=len(examples))
 
         if local_rank in [-1, 0] and cached_features_file is not None:
-            if lmdb_cache:
-                db = lmdb.open(cached_features_file, readonly=False, map_async=True)
-                for idx, feature in enumerate(features):
-                    write_to_lmdb(
-                        db, b"src_ids_%d" % idx, 
-                        serialize_array(feature["source_ids"], dtype=lmdb_dtype))
-                    write_to_lmdb(
-                        db, b"tgt_ids_%d" % idx,
-                        serialize_array(feature["target_ids"], dtype=lmdb_dtype))
-                write_to_lmdb(db, b"__start__", serialize_str(0))
-                write_to_lmdb(db, b"__size__", serialize_str(len(features)))
-                write_to_lmdb(db, b"__dtype__", serialize_str(lmdb_dtype))
-                db.sync()
-                db.close()
-                logger.info("db_key_idx = %d" % len(features))
-                del features
-                features = cached_features_file
-                logger.info("Saving features into cached lmdb dir %s", cached_features_file)
-            else:
-                logger.info("Saving features into cached file %s", cached_features_file)
-                torch.save(features, cached_features_file)
+            logger.info("Saving features into cached file %s", cached_features_file)
+            torch.save(features, cached_features_file)
 
     # Make sure only the first process in distributed training process the dataset, and the others will use the cache
     if local_rank == 0:

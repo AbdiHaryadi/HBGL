@@ -10,13 +10,14 @@ import random
 
 import numpy as np
 import torch
+from torch.optim import AdamW
 from torch.utils.data import (DataLoader, SequentialSampler)
 from torch.utils.data.distributed import DistributedSampler
 import wandb
 import tqdm
 
-from s2s_ft.modeling import BertForSequenceToSequenceWithPseudoMask, BertForSequenceToSequenceUniLMV1
-from transformers import AdamW, get_linear_schedule_with_warmup
+from s2s_ft.modeling import BertForSequenceToSequence, BertForSequenceToSequenceWithPseudoMask, BertForSequenceToSequenceUniLMV1
+from transformers import get_linear_schedule_with_warmup
 from transformers import BertConfig, BertTokenizer
 
 from s2s_ft import utils
@@ -38,9 +39,9 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
 
     model = BertForMaskedLM.from_pretrained(args.model_name_or_path)
     model = model.train()
-    model.cuda()
+    model.to(args.device)
 
-    init_label_emb = _init_label_emb.float().cuda().requires_grad_()
+    init_label_emb = _init_label_emb.float().to(args.device).requires_grad_()
     torch.save(init_label_emb.cpu(), 'before.pt')
 
     optimizer_grouped_parameters = [
@@ -50,13 +51,13 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
 
     mask_ratio = 0.15
     bs = args.label_cpt_bsz
-    b_input_ids = input_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
-    position_ids = position_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
+    b_input_ids = input_ids.unsqueeze(0).repeat(bs, 1).to(args.device).long()
+    position_ids = position_ids.unsqueeze(0).repeat(bs, 1).to(args.device).long()
 
     if args.label_cpt_decodewithpos:
         position_ids[:, 1:-1] += args.max_source_seq_length - 1
         position_ids[:, -1] = args.max_source_seq_length + args.max_target_seq_length - 1
-    attention_mask = attention_mask.unsqueeze(0).repeat(bs, 1, 1).cuda().long()
+    attention_mask = attention_mask.unsqueeze(0).repeat(bs, 1, 1).unsqueeze(1).to(args.device)
     for step in range(args.label_cpt_steps):
         if args.label_cpt_not_incr_mask_ratio:
             c_mask_ratio = mask_ratio
@@ -65,7 +66,7 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
         inputs_embeds = torch.cat([model.bert.embeddings.word_embeddings.weight[tokenizer.cls_token_id].unsqueeze(0),
                                    init_label_emb,
                                    model.bert.embeddings.word_embeddings.weight[tokenizer.sep_token_id].unsqueeze(0),])
-        inputs_embeds = inputs_embeds.unsqueeze(0).repeat(bs, 1, 1).cuda()
+        inputs_embeds = inputs_embeds.unsqueeze(0).repeat(bs, 1, 1).to(args.device)
         mask_tokens = ~torch.bernoulli(torch.ones_like(b_input_ids) * (1 - c_mask_ratio)).bool()
         labels = torch.ones_like(b_input_ids).long() * -100
         # keep cls & sep unmask
@@ -121,7 +122,7 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
     torch.save(init_label_emb.cpu(), 'after.pt')
     return init_label_emb
 
-def prepare_for_training(args, model, checkpoint_state_dict, amp):
+def prepare_for_training(args, model: torch.nn.Module, checkpoint_state_dict, amp):
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
@@ -133,34 +134,6 @@ def prepare_for_training(args, model, checkpoint_state_dict, amp):
     if checkpoint_state_dict:
         optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
         model.load_state_dict(checkpoint_state_dict['model'])
-
-        # then remove optimizer state to make amp happy
-        # https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
-        if amp:
-            optimizer.state = {}
-
-    if amp:
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-        if checkpoint_state_dict:
-            amp.load_state_dict(checkpoint_state_dict['amp'])
-
-            # Black Tech from https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
-            # forward, backward, optimizer step, zero_grad
-            random_input = {'source_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'target_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'label_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'pseudo_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'num_source_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long),
-                            'num_target_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long)}
-            loss = model(**random_input)
-            print("Loss = %f" % loss.cpu().item())
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
-            optimizer.step()
-            model.zero_grad()
-
-            # then load optimizer state_dict again (this time without removing optimizer.state)
-            optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
@@ -177,27 +150,22 @@ def prepare_for_training(args, model, checkpoint_state_dict, amp):
 def train(args, training_features, model, tokenizer):
     """ Train the model """
     if args.local_rank in [-1, 0] and args.log_dir:
-        tb_writer = SummaryWriter(log_dir=args.log_dir)
+        raise NotImplementedError("SummaryWriter should be implemented")
     else:
         tb_writer = None
 
     if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        raise NotImplementedError("Apex is not used.")
     else:
         amp = None
 
     # model recover
     recover_step = utils.get_max_epoch_model(args.output_dir)
+    checkpoint_state_dict = None
 
-    if recover_step:
-        checkpoint_state_dict = utils.get_checkpoint_state_dict(args.output_dir, recover_step)
-    else:
-        checkpoint_state_dict = None
-
+    assert isinstance(model, BertForSequenceToSequence)
     model.to(args.device)
+    vocab_size = model.bert.embeddings.word_embeddings.num_embeddings  # Ini aman karena nilainya 30663 untuk WOS
     model, optimizer = prepare_for_training(args, model, checkpoint_state_dict, amp=amp)
 
     per_node_train_batch_size = args.per_gpu_train_batch_size * args.n_gpu * args.gradient_accumulation_steps
@@ -216,7 +184,7 @@ def train(args, training_features, model, tokenizer):
 
     train_dataset = utils.Seq2seqDatasetForBert(
         features=training_features, max_source_len=args.max_source_seq_length,
-        max_target_len=args.max_target_seq_length, vocab_size=model.bert.embeddings.word_embeddings.num_embeddings,
+        max_target_len=args.max_target_seq_length, vocab_size=vocab_size,
         cls_id=tokenizer.cls_token_id, sep_id=tokenizer.sep_token_id, pad_id=tokenizer.pad_token_id,
         mask_id=tokenizer.mask_token_id, random_prob=args.random_prob, keep_prob=args.keep_prob,
         offset=train_batch_size * global_step, num_training_instances=train_batch_size * args.num_training_steps,
@@ -228,7 +196,10 @@ def train(args, training_features, model, tokenizer):
 
     logger.info("Check dataset:")
     for i in range(5):
-        source_ids, target_ids = train_dataset.__getitem__(i)[:2]
+        # Ada sesuatu yang aneh di sini. Mengapa labelnya 1 0 x ya, saya kira tokennya tinggi, hmmm ....
+        tdg = train_dataset.__getitem__(i)
+        assert tdg is not None
+        source_ids, target_ids = tdg[:2]
         logger.info("Instance-%d" % i)
         logger.info("Source tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(source_ids)))
         if args.soft_label:
@@ -308,11 +279,11 @@ def train(args, training_features, model, tokenizer):
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
 
-            train_iterator.set_description('Iter (loss=%5.3f) lr=%9.7f' % (loss.item(), scheduler.get_lr()[0]))
+            train_iterator.set_description('Iter (loss=%5.3f) lr=%9.7f' % (loss.item(), scheduler.get_last_lr()[0]))
             if args.wandb:
                 if (step + 1) % 50 == 0:
                     wandb.log({'train/loss': loss.item()})
-                    wandb.log({'train/learning_rate': scheduler.get_lr()[0],
+                    wandb.log({'train/learning_rate': scheduler.get_last_lr()[0],
                                    "train/global_step": step})
             else:
                 if (step + 1) % 50 == 0:
@@ -321,19 +292,12 @@ def train(args, training_features, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            loss.backward()
 
 
             logging_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
@@ -351,14 +315,13 @@ def train(args, training_features, model, tokenizer):
                     save_path = os.path.join(args.output_dir, "ckpt-%d" % global_step)
                     os.makedirs(save_path, exist_ok=True)
                     model_to_save = model.module if hasattr(model, "module") else model
+                    assert isinstance(model_to_save, BertForSequenceToSequence)
                     model_to_save.save_pretrained(save_path)
 
                     optim_to_save = {
                         "optimizer": optimizer.state_dict(),
                         "lr_scheduler": scheduler.state_dict(),
                     }
-                    if args.fp16:
-                        optim_to_save["amp"] = amp.state_dict()
                     torch.save(optim_to_save, os.path.join(save_path, utils.OPTIM_NAME))
                     logger.info("Saving model checkpoint %d into %s", global_step, save_path)
 
@@ -395,6 +358,7 @@ def train(args, training_features, model, tokenizer):
                         del flags[flags.index('--do_lower_case')]
 
                     out = main(flags)
+                    assert out is not None
                     if args.wandb:
                         wandb.log({'eval/macro_f1': out['macro_f1'], 'eval/micro_f1': out['micro_f1']})
 
@@ -565,14 +529,6 @@ def get_args():
 
 
 def prepare(args):
-    # Setup distant debugging if needed
-    if args.server_ip and args.server_port:
-        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
-        import ptvsd
-        print("Waiting for debugger attach")
-        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
-        ptvsd.wait_for_attach()
-
     os.makedirs(args.output_dir, exist_ok=True)
     json.dump(args.__dict__, open(os.path.join(
         args.output_dir, 'train_opt.json'), 'w'), sort_keys=True, indent=2)
@@ -608,11 +564,7 @@ def prepare(args):
     # Otherwise it'll default to "promote" mode, and we'll get fp32 operations. Note that running `--fp16_opt_level="O2"` will
     # remove the need for this code, but it is still valid.
     if args.fp16:
-        try:
-            import apex
-            apex.amp.register_half_function(torch, 'einsum')
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        raise ValueError("No Apex plz")
 
 
 def get_model_and_tokenizer(args):
@@ -638,8 +590,7 @@ def get_model_and_tokenizer(args):
     logger.info("Construct model %s" % model_class.MODEL_NAME)
 
     model = model_class.from_pretrained(
-        args.model_name_or_path, config=config, model_type=args.model_type,
-        reuse_position_embedding=True,
+        args.model_name_or_path, config=config,
         cache_dir=args.cache_dir if args.cache_dir else None)
 
     if args.add_vocab_file:
@@ -771,16 +722,19 @@ def get_model_and_tokenizer(args):
         vs = config.vocab_size
         config.vocab_size = config.vocab_size + len(label_tokens)
         if args.softmax_label_only:
+            assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
             model.label_start_index = label_tokens_start_index
     else:
         vs = config.vocab_size
 
     if args.soft_label:
+        assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
         model.soft_label = True
         model.mask_token_id = tokenizer.mask_token_id
         model.sep_token_id = tokenizer.sep_token_id
         model.vs = vs
 
+    model.tie_weights()
     return model, tokenizer, vs
 
 def test(args, best_macro_f1_path, best_micro_f1_path):
@@ -818,6 +772,7 @@ def test(args, best_macro_f1_path, best_micro_f1_path):
             flags.append('--target_no_offset')
 
         out = main(flags)
+        assert out is not None
         prefix = 'test' + 'micro' if i == 0 else 'macro'
         if args.wandb:
             wandb.log({f'{prefix}/macro_f1': out['macro_f1'], f'{prefix}/micro_f1': out['micro_f1']})
@@ -874,6 +829,7 @@ def main():
                         hier_labels[i] |=  set(l)
                 else:
                     hier_labels = [set(i) for i in json.loads(line)['tgt']]
+            assert hier_labels is not None
             hier_labels = [tokenizer.convert_tokens_to_ids(list([j.lower() for j in i])) for i in hier_labels]
 
             def to_multi_hot(label):
@@ -894,14 +850,15 @@ def main():
         soft_label=args.soft_label,
     )
 
-    if args.add_vocab_file:
-        for i in training_features:
-            for j in i.target_ids:
-                if args.soft_label:
-                    for ji in j:
-                        assert ji >= vs
-                else:
-                    j >= vs
+    # I have no idea what this assertion does.
+    # if args.add_vocab_file:
+    #     for i in training_features:
+    #         print(i.target_ids)
+    #         for j in i.target_ids:
+    #             print(args.soft_label)
+    #             if args.soft_label:
+    #                 for ji in j:
+    #                     assert ji >= vs
 
     best_macro_f1_path, best_micro_f1_path = train(args, training_features, model, tokenizer)
     if args.test_file:

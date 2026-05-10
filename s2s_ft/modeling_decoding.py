@@ -10,19 +10,15 @@ import copy
 import json
 import math
 import logging
-import tarfile
-import tempfile
-import shutil
 import numpy as np
 
 import torch
 from torch import nn
-from torch.nn import CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 
-from transformers.file_utils import cached_path
-
 from torch.nn.modules.loss import _Loss
+from transformers import PreTrainedConfig, PreTrainedModel
 
 
 class LabelSmoothingLoss(_Loss):
@@ -58,6 +54,7 @@ class LabelSmoothingLoss(_Loss):
         batch_size, num_pos = target.size(0), target.size(1)
         output = output.view(-1, self.tgt_vocab_size)
         target = target.view(-1)
+        assert isinstance(self.one_hot, torch.Tensor)
         model_prob = self.one_hot.repeat(target.size(0), 1)
         model_prob.scatter_(1, target.unsqueeze(1), self.confidence)
         model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
@@ -82,7 +79,8 @@ PRETRAINED_MODEL_ARCHIVE_MAP = {
     'unilm1.2-base-uncased': "https://unilm.blob.core.windows.net/ckpt/unilm1.2-base-uncased.bin"
 }
 CONFIG_NAME = 'config.json'
-WEIGHTS_NAME = 'pytorch_model.bin'
+# WEIGHTS_NAME = 'pytorch_model.bin'
+WEIGHTS_NAME = 'model.safetensors'
 
 
 def gelu(x):
@@ -100,7 +98,7 @@ def swish(x):
 ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish}
 
 
-class BertConfig(object):
+class BertConfig(PreTrainedConfig):
     """Configuration class to store the configuration of a `BertModel`.
     """
 
@@ -151,6 +149,7 @@ class BertConfig(object):
             initializer_range: The sttdev of the truncated_normal_initializer for
                 initializing all weight matrices.
         """
+        super().__init__()
         if isinstance(vocab_size_or_config_json_file, str):
             with open(vocab_size_or_config_json_file, "r", encoding='utf-8') as reader:
                 json_config = json.loads(reader.read())
@@ -211,27 +210,20 @@ class BertConfig(object):
         """Serializes this instance to a JSON string."""
         return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
+class BertLayerNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-5):
+        """Construct a layernorm module in the TF style (epsilon inside the square root).
+        """
+        super(BertLayerNorm, self).__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
 
-try:
-    from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
-except ImportError:
-    print("Better speed can be achieved with apex installed from https://www.github.com/nvidia/apex.")
-
-
-    class BertLayerNorm(nn.Module):
-        def __init__(self, hidden_size, eps=1e-5):
-            """Construct a layernorm module in the TF style (epsilon inside the square root).
-            """
-            super(BertLayerNorm, self).__init__()
-            self.weight = nn.Parameter(torch.ones(hidden_size))
-            self.bias = nn.Parameter(torch.zeros(hidden_size))
-            self.variance_epsilon = eps
-
-        def forward(self, x):
-            u = x.mean(-1, keepdim=True)
-            s = (x - u).pow(2).mean(-1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-            return self.weight * x + self.bias
+    def forward(self, x):
+        u = x.mean(-1, keepdim=True)
+        s = (x - u).pow(2).mean(-1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+        return self.weight * x + self.bias
 
 
 class PositionalEmbedding(nn.Module):
@@ -244,6 +236,7 @@ class PositionalEmbedding(nn.Module):
         self.register_buffer('inv_freq', inv_freq)
 
     def forward(self, pos_seq, bsz=None):
+        assert isinstance(self.inv_freq, torch.Tensor)
         sinusoid_inp = torch.ger(pos_seq, self.inv_freq)
         pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
 
@@ -286,8 +279,10 @@ class BertEmbeddings(nn.Module):
     def forward(self, input_ids, token_type_ids=None, position_ids=None, task_idx=None, inputs_embeds=None):
         if input_ids is not None:
             seq_length = input_ids.size()
-        else:
+        elif inputs_embeds is not None:
             seq_length = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("input_ids and input_embeds is None!")
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -415,6 +410,7 @@ class BertSelfAttention(nn.Module):
         value_layer = self.transpose_for_scores(mixed_value_layer, mask_qkv)
 
         if key_history is not None and not isinstance(key_history, list):
+            assert value_history is not None
             key_layer = torch.cat((key_history, key_layer), dim=-2)
             value_layer = torch.cat((value_history, value_layer), dim=-2)
 
@@ -443,6 +439,7 @@ class BertSelfAttention(nn.Module):
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
 
         if self.uni_debug_flag:
+            assert isinstance(self.debug_attention_probs, torch.Tensor)
             _pos = attention_probs.size(-1)
             self.debug_attention_probs[:_pos, :_pos].copy_(
                 attention_probs[0].mean(0).view(_pos, _pos))
@@ -603,6 +600,7 @@ class BertEncoder(nn.Module):
                     set_key = key_history if len(key_history) < len(self.layer) else key_history[i]
                 set_value = None
                 if isinstance(value_history, list):
+                    assert key_history is not None
                     set_value = value_history if len(key_history) < len(self.layer) else value_history[i]
                 hidden_states = layer_module(
                     hidden_states, attention_mask, mask_qkv=mask_qkv, seg_ids=seg_ids,
@@ -732,21 +730,121 @@ class BertPreTrainingHeads(nn.Module):
         return prediction_scores, seq_relationship_score
 
 
-class PreTrainedBertModel(nn.Module):
-    """ An abstract class to handle weights initialization and
-        a simple interface for dowloading and loading pretrained models.
-    """
+# class PreTrainedBertModel(nn.Module):
+#     """ An abstract class to handle weights initialization and
+#         a simple interface for dowloading and loading pretrained models.
+#     """
 
-    def __init__(self, config, *inputs, **kwargs):
-        super(PreTrainedBertModel, self).__init__()
-        if not isinstance(config, BertConfig):
-            raise ValueError(
-                "Parameter config in `{}(config)` should be an instance of class `BertConfig`. "
-                "To create a model from a Google pretrained model use "
-                "`model = {}.from_pretrained(PRETRAINED_MODEL_NAME)`".format(
-                    self.__class__.__name__, self.__class__.__name__
-                ))
-        self.config = config
+#     def __init__(self, config, *inputs, **kwargs):
+#         super(PreTrainedBertModel, self).__init__()
+#         if not isinstance(config, BertConfig):
+#             raise ValueError(
+#                 "Parameter config in `{}(config)` should be an instance of class `BertConfig`. "
+#                 "To create a model from a Google pretrained model use "
+#                 "`model = {}.from_pretrained(PRETRAINED_MODEL_NAME)`".format(
+#                     self.__class__.__name__, self.__class__.__name__
+#                 ))
+#         self.config = config
+#         self.missing_keys = []
+
+#     def init_bert_weights(self, module):
+#         """ Initialize the weights.
+#         """
+#         if isinstance(module, (nn.Linear, nn.Embedding)):
+#             # Slightly different from the TF version which uses truncated_normal for initialization
+#             # cf https://github.com/pytorch/pytorch/pull/5617
+#             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+#             # module.weight.data.copy_(torch.Tensor(
+#             #     truncnorm.rvs(-1, 1, size=list(module.weight.data.shape)) * self.config.initializer_range))
+#         elif isinstance(module, BertLayerNorm):
+#             module.bias.data.zero_()
+#             module.weight.data.fill_(1.0)
+#         if isinstance(module, nn.Linear) and module.bias is not None:
+#             module.bias.data.zero_()
+
+#     @classmethod
+#     def from_pretrained(cls, pretrained_model_name, config, state_dict=None, cache_dir=None, *inputs, **kwargs):
+#         """
+#         Instantiate a PreTrainedBertModel from a pre-trained model file or a pytorch state dict.
+#         Download and cache the pre-trained model file if needed.
+#         Params:
+#             pretrained_model_name: either:
+#                 - a str with the name of a pre-trained model to load selected in the list of:
+#                     . `bert-base-uncased`
+#                     . `bert-large-uncased`
+#                     . `bert-base-cased`
+#                     . `bert-base-multilingual`
+#                     . `bert-base-chinese`
+#                 - a path or url to a pretrained model archive containing:
+#                     . `bert_config.json` a configuration file for the model
+#                     . `pytorch_model.bin` a PyTorch dump of a BertForPreTraining instance
+#             cache_dir: an optional path to a folder in which the pre-trained models will be cached.
+#             state_dict: an optional state dictionnary (collections.OrderedDict object) to use instead of Google pre-trained models
+#             *inputs, **kwargs: additional input for the specific Bert class
+#                 (ex: num_labels for BertForSequenceClassification)
+#         """
+#         logger.info("Model config {}".format(config))
+
+#         # clean the arguments in kwargs
+#         for arg_clean in ('config_path', 'type_vocab_size', 'relax_projection', 'new_pos_ids', 'task_idx',
+#                           'max_position_embeddings', 'fp32_embedding', 'ffn_type', 'label_smoothing',
+#                           'hidden_dropout_prob', 'attention_probs_dropout_prob', 'num_qkv', 'seg_emb',
+#                           'word_emb_map', 'num_labels', 'num_rel', 'num_sentlvl_labels'):
+#             if arg_clean in kwargs:
+#                 del kwargs[arg_clean]
+
+#         # Instantiate model.
+#         model = cls(config, *inputs, **kwargs)
+#         if state_dict is None:
+#             weights_path = os.path.join(pretrained_model_name, WEIGHTS_NAME)
+#             state_dict = torch.load(weights_path)
+
+#         old_keys = []
+#         new_keys = []
+#         for key in state_dict.keys():
+#             new_key = None
+#             if 'gamma' in key:
+#                 new_key = key.replace('gamma', 'weight')
+#             if 'beta' in key:
+#                 new_key = key.replace('beta', 'bias')
+#             if new_key:
+#                 old_keys.append(key)
+#                 new_keys.append(new_key)
+#         for old_key, new_key in zip(old_keys, new_keys):
+#             state_dict[new_key] = state_dict.pop(old_key)
+
+#         missing_keys = []
+#         unexpected_keys = []
+#         error_msgs = []
+#         # copy state_dict so _load_from_state_dict can modify it
+#         metadata = getattr(state_dict, '_metadata', None)
+#         state_dict = state_dict.copy()
+#         if metadata is not None:
+#             state_dict._metadata = metadata
+
+#         def load(module, prefix=''):
+#             local_metadata = {} if metadata is None else metadata.get(
+#                 prefix[:-1], {})
+#             module._load_from_state_dict(
+#                 state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
+#             for name, child in module._modules.items():
+#                 if child is not None:
+#                     load(child, prefix + name + '.')
+
+#         load(model, prefix='' if hasattr(model, 'bert') else 'bert.')
+#         model.missing_keys = missing_keys
+#         if len(missing_keys) > 0:
+#             logger.info("Weights of {} not initialized from pretrained model: {}".format(
+#                 model.__class__.__name__, missing_keys))
+#         if len(unexpected_keys) > 0:
+#             logger.info("Weights from pretrained model not used in {}: {}".format(
+#                 model.__class__.__name__, unexpected_keys))
+#         if len(error_msgs) > 0:
+#             logger.info('\n'.join(error_msgs))
+#         return model
+    
+class PreTrainedBertModel(PreTrainedModel):
+    config_class = BertConfig
 
     def init_bert_weights(self, module):
         """ Initialize the weights.
@@ -762,88 +860,6 @@ class PreTrainedBertModel(nn.Module):
             module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name, config, state_dict=None, cache_dir=None, *inputs, **kwargs):
-        """
-        Instantiate a PreTrainedBertModel from a pre-trained model file or a pytorch state dict.
-        Download and cache the pre-trained model file if needed.
-        Params:
-            pretrained_model_name: either:
-                - a str with the name of a pre-trained model to load selected in the list of:
-                    . `bert-base-uncased`
-                    . `bert-large-uncased`
-                    . `bert-base-cased`
-                    . `bert-base-multilingual`
-                    . `bert-base-chinese`
-                - a path or url to a pretrained model archive containing:
-                    . `bert_config.json` a configuration file for the model
-                    . `pytorch_model.bin` a PyTorch dump of a BertForPreTraining instance
-            cache_dir: an optional path to a folder in which the pre-trained models will be cached.
-            state_dict: an optional state dictionnary (collections.OrderedDict object) to use instead of Google pre-trained models
-            *inputs, **kwargs: additional input for the specific Bert class
-                (ex: num_labels for BertForSequenceClassification)
-        """
-        logger.info("Model config {}".format(config))
-
-        # clean the arguments in kwargs
-        for arg_clean in ('config_path', 'type_vocab_size', 'relax_projection', 'new_pos_ids', 'task_idx',
-                          'max_position_embeddings', 'fp32_embedding', 'ffn_type', 'label_smoothing',
-                          'hidden_dropout_prob', 'attention_probs_dropout_prob', 'num_qkv', 'seg_emb',
-                          'word_emb_map', 'num_labels', 'num_rel', 'num_sentlvl_labels'):
-            if arg_clean in kwargs:
-                del kwargs[arg_clean]
-
-        # Instantiate model.
-        model = cls(config, *inputs, **kwargs)
-        if state_dict is None:
-            weights_path = os.path.join(pretrained_model_name, WEIGHTS_NAME)
-            state_dict = torch.load(weights_path)
-
-        old_keys = []
-        new_keys = []
-        for key in state_dict.keys():
-            new_key = None
-            if 'gamma' in key:
-                new_key = key.replace('gamma', 'weight')
-            if 'beta' in key:
-                new_key = key.replace('beta', 'bias')
-            if new_key:
-                old_keys.append(key)
-                new_keys.append(new_key)
-        for old_key, new_key in zip(old_keys, new_keys):
-            state_dict[new_key] = state_dict.pop(old_key)
-
-        missing_keys = []
-        unexpected_keys = []
-        error_msgs = []
-        # copy state_dict so _load_from_state_dict can modify it
-        metadata = getattr(state_dict, '_metadata', None)
-        state_dict = state_dict.copy()
-        if metadata is not None:
-            state_dict._metadata = metadata
-
-        def load(module, prefix=''):
-            local_metadata = {} if metadata is None else metadata.get(
-                prefix[:-1], {})
-            module._load_from_state_dict(
-                state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
-            for name, child in module._modules.items():
-                if child is not None:
-                    load(child, prefix + name + '.')
-
-        load(model, prefix='' if hasattr(model, 'bert') else 'bert.')
-        model.missing_keys = missing_keys
-        if len(missing_keys) > 0:
-            logger.info("Weights of {} not initialized from pretrained model: {}".format(
-                model.__class__.__name__, missing_keys))
-        if len(unexpected_keys) > 0:
-            logger.info("Weights from pretrained model not used in {}: {}".format(
-                model.__class__.__name__, unexpected_keys))
-        if len(error_msgs) > 0:
-            logger.info('\n'.join(error_msgs))
-        return model
-
 
 class BertModel(PreTrainedBertModel):
     """BERT model ("Bidirectional Embedding Representations from a Transformer").
@@ -884,6 +900,7 @@ class BertModel(PreTrainedBertModel):
 
     def rescale_some_parameters(self):
         for layer_id, layer in enumerate(self.encoder.layer):
+            assert isinstance(layer, BertLayer)
             layer.attention.output.dense.weight.data.div_(
                 math.sqrt(2.0 * (layer_id + 1)))
             layer.output.dense.weight.data.div_(math.sqrt(2.0 * (layer_id + 1)))
@@ -953,6 +970,7 @@ class BertModelIncr(BertModel):
             input_ids, token_type_ids, position_ids, task_idx=task_idx, inputs_embeds=inputs_embeds)
 
         if self.rel_pos_bias is not None:
+            assert rel_pos is not None
             # print("Rel pos size = %s" % str(rel_pos.size()))
             rel_pos = F.one_hot(rel_pos, num_classes=self.config.rel_pos_bins).type_as(embedding_output)
             # print("Rel pos size = %s" % str(rel_pos.size()))
@@ -1123,8 +1141,10 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
         self.label_start_index = -1
         self.ab_bound_token_id = -1
         self.soft_label = False
-        self.hier_labels = None
+        self.hier_labels = []
         self.soft_label_hier_real = False
+
+        self.post_init()
 
     def forward(self, input_ids, token_type_ids, position_ids, attention_mask, task_idx=None, mask_qkv=None):
         if self.search_beam_size > 1:
@@ -1145,6 +1165,8 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
         next_pos = input_length
         if self.pos_shift:
             sep_ids = input_ids.new(batch_size, 1).fill_(self.eos_id)
+        else:
+            sep_ids = None
 
         if self.bert.rel_pos_bias is not None:
             rel_pos_mat = position_ids.unsqueeze(-2) - position_ids.unsqueeze(-1)
@@ -1158,7 +1180,9 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                 # set curr_ids to None in two more loops
                 curr_length = pred_embeds.size()[1]
                 if self.pos_shift:
+                    assert sep_ids is not None
                     if next_pos == input_length:
+                        raise NotImplementedError("curr_ids are ill-defined.")
                         x_input_ids = torch.cat((curr_ids, sep_ids), dim=1)
                         x_input_embeds = torch.cat((pred_embeds,
                                                     self.bert.embeddings.word_embeddings(sep_ids)), dim=1)
@@ -1172,9 +1196,10 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                     x_input_embeds = torch.cat((pred_embeds,
                                                 self.bert.embeddings.word_embeddings(mask_ids)), dim=1)
                 x_input_ids = None
-            else:
+            elif curr_ids is not None:
                 curr_length = list(curr_ids.size())[1]
                 if self.pos_shift:
+                    assert sep_ids is not None
                     if next_pos == input_length:
                         x_input_ids = torch.cat((curr_ids, sep_ids), dim=1)
                         start_pos = 0
@@ -1185,6 +1210,8 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                     start_pos = next_pos - curr_length
                     x_input_ids = torch.cat((curr_ids, mask_ids), dim=1)
                 x_input_embeds = None
+            else:
+                raise ValueError("self.soft_label and curr_ids are not defined")
 
 
             curr_token_type_ids = token_type_ids[:, start_pos:next_pos + 1]
@@ -1212,6 +1239,7 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             last_hidden = new_encoded_layers[-1][:, -1:, :]
             if self.soft_label:
                 if self.soft_label_hier_real:
+                    # TODO: Adapt the GPU usage after the other case can run without error
                     curr_hier = len(output_ids)
                     hl = self.hier_labels[curr_hier]
                     prediction_scores, _ = self.cls(last_hidden, None, task_idx=task_idx)
@@ -1243,10 +1271,12 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                                                 prediction_scores[:, :, lsi:]], dim=-1)
 
                     prediction_scores = torch.sigmoid(prediction_scores) > 0.5
+                    # prediction_scores = prediction_scores.cpu()
 
                     _pred_ids = []
                     for i in range(prediction_scores.shape[0]):
-                        pred_ids = torch.arange(prediction_scores.shape[-1])[prediction_scores[i, -1]]
+                        arange_tensor = torch.arange(prediction_scores.shape[-1]).to(prediction_scores.device)
+                        pred_ids = arange_tensor[prediction_scores[i, -1]]
                         sep_mask = pred_ids == 0
                         pred_ids[sep_mask] = self.eos_id
                         pred_ids[~sep_mask] += lsi - 1
@@ -1325,10 +1355,10 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             next_pos += 1
 
         if self.soft_label:
-            _output_ids = [[] for _ in output_ids[0]]
+            _output_ids = []
             max_l = 0
-            for i, oi in enumerate(_output_ids):
-                _output_ids[i] = torch.cat([j[i] for j in output_ids], dim=0)
+            for i in range(len(output_ids[0])):
+                _output_ids_i = torch.cat([j[i] for j in output_ids], dim=0)
                 # t = False
                 # for j in _output_ids[i].tolist():
                 #     try:
@@ -1337,10 +1367,11 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                 #         print(j)
                 #     if j == 102: t = True
                 index = 10000
-                for index, d in enumerate(_output_ids[i].tolist()):
+                for index, d in enumerate(_output_ids_i.tolist()):
                     if d == 102: break
-                _output_ids[i] = sorted(list(set(_output_ids[i].tolist()[:index])), reverse=True)
-                max_l = max(len(_output_ids[i]), max_l)
+                _output_ids_i = sorted(list(set(_output_ids_i.tolist()[:index])), reverse=True)
+                max_l = max(len(_output_ids_i), max_l)
+                _output_ids.append(_output_ids_i)
 
             for i, oi in enumerate(_output_ids):
                 _output_ids[i] = torch.LongTensor(oi + [0] * (max_l - len(oi))).unsqueeze(0)
@@ -1628,12 +1659,15 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             return out_tensor
 
         # convert to tensors for DataParallel
+        new_traces = {}
         for k in ('pred_seq', 'scores', 'wids', 'ptrs'):
             ts_list = traces[k]
             if not isinstance(ts_list[0], torch.Tensor):
                 dt = torch.float if k == 'scores' else torch.long
                 ts_list = [torch.tensor(it, dtype=dt) for it in ts_list]
-            traces[k] = _pad_sequence(
+            new_traces[k] = _pad_sequence(
                 ts_list, output_length, padding_value=0).to(input_ids.device)
+            
+        traces = new_traces
 
         return traces

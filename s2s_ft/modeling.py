@@ -10,18 +10,11 @@ from torch.nn import BCEWithLogitsLoss
 from torch.nn.modules.loss import _Loss
 import torch.nn.functional as F
 
-from transformers.modeling_bert import \
+from transformers.models.bert.modeling_bert import \
     BertPreTrainedModel, BertSelfOutput, BertIntermediate, \
     BertOutput, BertPredictionHeadTransform, BertPooler
-from transformers.modeling_roberta import ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers.modeling_bert import BERT_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers.modeling_distilbert import DISTILBERT_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers.modeling_xlm_roberta import XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers.modeling_electra import ELECTRA_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers.file_utils import WEIGHTS_NAME
 
 from s2s_ft.config import BertForSeq2SeqConfig
-from s2s_ft.convert_state_dict import get_checkpoint_from_transformer_cache, state_dict_convert
 
 logger = logging.getLogger(__name__)
 
@@ -48,20 +41,13 @@ class BertPreTrainedForSeq2SeqModel(BertPreTrainedModel):
     """
     config_class = BertForSeq2SeqConfig
     supported_convert_pretrained_model_archive_map = {
-        "bert": BERT_PRETRAINED_MODEL_ARCHIVE_MAP,
-        "roberta": ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP,
-        "xlm-roberta": XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP, 
         "unilm": UNILM_PRETRAINED_MODEL_ARCHIVE_MAP, 
         "minilm": MINILM_PRETRAINED_MODEL_ARCHIVE_MAP, 
     }
     base_model_prefix = "unilm_for_seq2seq"
     pretrained_model_archive_map = {
-        **ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP,
-        **XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP, 
-        **BERT_PRETRAINED_MODEL_ARCHIVE_MAP,
         **UNILM_PRETRAINED_MODEL_ARCHIVE_MAP,
-        **MINILM_PRETRAINED_MODEL_ARCHIVE_MAP, 
-        **ELECTRA_PRETRAINED_MODEL_ARCHIVE_MAP, 
+        **MINILM_PRETRAINED_MODEL_ARCHIVE_MAP,
     }
 
     def _init_weights(self, module):
@@ -77,58 +63,9 @@ class BertPreTrainedForSeq2SeqModel(BertPreTrainedModel):
             module.bias.data.zero_()
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, reuse_position_embedding=None, *model_args, **kwargs):
-        model_type = kwargs.pop('model_type', 'unilm')
-        if model_type is not None and "state_dict" not in kwargs:
-            if model_type in cls.supported_convert_pretrained_model_archive_map:
-                pretrained_model_archive_map = cls.supported_convert_pretrained_model_archive_map[model_type]
-                if pretrained_model_name_or_path in pretrained_model_archive_map:
-                    state_dict = get_checkpoint_from_transformer_cache(
-                        archive_file=pretrained_model_archive_map[pretrained_model_name_or_path],
-                        pretrained_model_name_or_path=pretrained_model_name_or_path,
-                        pretrained_model_archive_map=pretrained_model_archive_map,
-                        cache_dir=kwargs.get("cache_dir", None), force_download=kwargs.get("force_download", None),
-                        proxies=kwargs.get("proxies", None), resume_download=kwargs.get("resume_download", None),
-                    )
-                    state_dict = state_dict_convert[model_type](state_dict)
-                    kwargs["state_dict"] = state_dict
-                    logger.info("Load HF ckpts")
-                elif os.path.isfile(pretrained_model_name_or_path):
-                    state_dict = torch.load(pretrained_model_name_or_path, map_location='cpu')
-                    kwargs["state_dict"] = state_dict_convert[model_type](state_dict)
-                    logger.info("Load local ckpts")
-                elif os.path.isdir(pretrained_model_name_or_path):
-                    state_dict = torch.load(os.path.join(pretrained_model_name_or_path, WEIGHTS_NAME), map_location='cpu')
-                    kwargs["state_dict"] = state_dict_convert[model_type](state_dict)
-                    logger.info("Load local ckpts")
-                else:
-                    raise RuntimeError("Not fined the pre-trained checkpoint !")
-
-        if kwargs["state_dict"] is None:
-            logger.info("s2s-ft does't support the model !")
-            raise NotImplementedError()
-
+    def _init_new_position_embeddings(cls, reuse_position_embedding, *model_args, **kwargs):
         config = kwargs["config"]
         state_dict = kwargs["state_dict"]
-        # initialize new position embeddings (From Microsoft/UniLM)
-        _k = 'bert.embeddings.position_embeddings.weight'
-        # if _k in state_dict and config.max_position_embeddings != state_dict[_k].shape[0]:
-        #     logger.info("config.max_position_embeddings != state_dict[bert.embeddings.position_embeddings.weight] ({0} - {1})".format(
-        #         config.max_position_embeddings, state_dict[_k].shape[0]))
-        #     if config.max_position_embeddings > state_dict[_k].shape[0]:
-        #         old_size = state_dict[_k].shape[0]
-        #         # state_dict[_k].data = state_dict[_k].data.resize_(config.max_position_embeddings, state_dict[_k].shape[1])
-        #         state_dict[_k].resize_(
-        #             config.max_position_embeddings, state_dict[_k].shape[1])
-        #         start = old_size
-        #         while start < config.max_position_embeddings:
-        #             chunk_size = min(
-        #                 old_size, config.max_position_embeddings - start)
-        #             state_dict[_k].data[start:start+chunk_size,
-        #                                 :].copy_(state_dict[_k].data[:chunk_size, :])
-        #             start += chunk_size
-        #     elif config.max_position_embeddings < state_dict[_k].shape[0]:
-        #         state_dict[_k].data = state_dict[_k].data[:config.max_position_embeddings, :]
 
         _k = 'bert.embeddings.position_embeddings.weight'
         if _k in state_dict:
@@ -159,8 +96,6 @@ class BertPreTrainedForSeq2SeqModel(BertPreTrainedModel):
                 state_dict[_k] = new_postion_embedding.data
                 del new_postion_embedding
 
-        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings.
@@ -185,11 +120,14 @@ class BertEmbeddings(nn.Module):
     def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None):
         if input_ids is not None:
             input_shape = input_ids.size()
-        else:
+            device = input_ids.device
+        elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
+            device = inputs_embeds.device
+        else:
+            raise ValueError("input_ids and inputs_embeds is None")
 
         seq_length = input_shape[1]
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
         if position_ids is None:
             position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).expand(input_shape)
@@ -268,6 +206,7 @@ class BertSelfAttention(nn.Module):
         mixed_query_layer = self.query(hidden_states)
         if split_lengths:
             assert not self.output_attentions
+        assert attention_mask is not None, "Attention mask should not be None."
 
         # If this is instantiated as a cross-attention module, the keys
         # and values come from an encoder; the attention mask needs to be
@@ -456,12 +395,12 @@ class BertModel(BertPreTrainedForSeq2SeqModel):
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
             input_shape = input_ids.size()
+            device = input_ids.device
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
+            device = inputs_embeds.device
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, device=device)
@@ -488,6 +427,7 @@ class BertModel(BertPreTrainedForSeq2SeqModel):
         embedding_output, position_ids = self.embeddings(
             input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds)
         if self.config.rel_pos_bins > 0:
+            assert self.rel_pos_bias is not None
             rel_pos_mat = position_ids.unsqueeze(-2) - position_ids.unsqueeze(-1)
             rel_pos = relative_position_bucket(
                 rel_pos_mat, num_buckets=self.config.rel_pos_bins, max_distance=self.config.max_rel_pos)
@@ -537,6 +477,7 @@ class LabelSmoothingLoss(_Loss):
         target (LongTensor): batch_size * num_pos
         """
         assert self.tgt_vocab_size == output.size(2)
+        assert isinstance(self.one_hot, torch.Tensor), "self.one_hot should be a Tensor."
         batch_size, num_pos = target.size(0), target.size(1)
         output = output.view(-1, self.tgt_vocab_size)
         target = target.view(-1)
@@ -586,6 +527,8 @@ def create_mask_and_position_ids(num_tokens, max_len, offset=None):
 
 class BertForSequenceToSequence(BertPreTrainedForSeq2SeqModel):
     MODEL_NAME = 'basic class'
+    hier_labels = []
+    _tied_weights_keys = {"cls.predictions.decoder_weight": "bert.embeddings.word_embeddings.weight"}
 
     def __init__(self, config):
         super(BertForSequenceToSequence, self).__init__(config)
@@ -605,7 +548,15 @@ class BertForSequenceToSequence(BertPreTrainedForSeq2SeqModel):
         else:
             self.crit_mask_lm_smoothed = None
             self.crit_mask_lm = nn.CrossEntropyLoss(reduction='none')
+        
+        self.post_init()
 
+    def update_cls_after_update_bert(self, config):
+        self.cls = BertOnlyMLMHead(config, self.bert.embeddings.word_embeddings.weight)
+
+    def tie_weights(self, missing_keys: set[str] | None = None, recompute_mapping: bool = True):
+        super().tie_weights(missing_keys, recompute_mapping)
+        self.cls.predictions.decoder_weight = self.bert.embeddings.word_embeddings.weight
 
 class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
     label_start_index = -1
@@ -613,6 +564,8 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
     MODEL_NAME = "BertForSequenceToSequenceWithPseudoMask"
     soft_label = False
     soft_label_hier_real = False
+    sep_token_id = -1
+    vs = -1
 
     @staticmethod
     def create_attention_mask(source_mask, target_mask, source_position_ids, target_span_ids):
@@ -703,31 +656,10 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
                                                   prediction_scores_masked[:, :, lsi:]], dim=-1)
 
             label_ids = new_label_ids
-            # print(prediction_scores_masked, label_ids)
         elif self.ab_bound_token_id > 0:
-            # prediction_scores_masked = self.cls(pseudo_sequence_output)
             hidden_states = self.cls.predictions.transform(pseudo_sequence_output)
             prediction_scores_masked = F.linear(hidden_states, weight=self.cls.predictions.decoder_weight, bias=self.cls.predictions.bias)
 
-            #a_tokens = label_ids[(label_ids < self.ab_bound_token_id) & (label_ids > 0 ) & (label_ids  != 102)]
-            #a_token_embs = self.cls.predictions.decoder_weight[a_tokens]
-
-            if False:
-                # slow way
-                b_token_embs = self.cls.predictions.decoder_weight[self.ab_bound_token_id:, ]
-
-                for i, label_id in enumerate(label_ids.tolist()):
-                    a = -1
-                    for j, l in enumerate(label_id):
-                        if l == 102 or l == 0: break
-                        if l > self.ab_bound_token_id:
-                            assert a > 0
-                            new_b_token_embs = b_token_embs + self.cls.predictions.decoder_weight[a]
-                            new_b_scores = F.linear(hidden_states[i, j], weight=new_b_token_embs,
-                                                    bias=self.cls.predictions.bias[self.ab_bound_token_id:])
-                            prediction_scores_masked[i, j,  self.ab_bound_token_id:] = new_b_scores
-                        else:
-                            a = l
             if True:
                 # fast way
                 b_token_embs = self.cls.predictions.decoder_weight[self.ab_bound_token_id:, ]
@@ -797,11 +729,13 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
                 F.log_softmax(prediction_scores_masked.float(), dim=-1), label_ids)
             pseudo_lm_loss = loss_mask_and_normalize(
                 masked_lm_loss.float(), target_mask)
-        else:
+        elif self.crit_mask_lm:
             masked_lm_loss = self.crit_mask_lm(
                 prediction_scores_masked.transpose(1, 2).float(), label_ids)
             pseudo_lm_loss = loss_mask_and_normalize(
                 masked_lm_loss.float(), target_mask)
+        else:
+            raise ValueError("pseudo_lm_loss is unimplemented for this case.")
 
         return pseudo_lm_loss
 
@@ -861,9 +795,11 @@ class BertForSequenceToSequenceUniLMV1(BertForSequenceToSequence):
         if self.crit_mask_lm_smoothed:
             masked_lm_loss = self.crit_mask_lm_smoothed(
                 F.log_softmax(prediction_scores_masked.float(), dim=-1), masked_ids)
-        else:
+        elif self.crit_mask_lm:
             masked_lm_loss = self.crit_mask_lm(
                 prediction_scores_masked.transpose(1, 2).float(), masked_ids)
+        else:
+            raise ValueError("masked_lm_loss is unimplemented for this case.")
         pseudo_lm_loss = loss_mask_and_normalize(
             masked_lm_loss.float(), masked_weight)
 
