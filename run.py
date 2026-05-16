@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import json
+import pickle
 import random
 
 import numpy as np
@@ -16,12 +17,14 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 import tqdm
 
+from run_test_utils import setup_model_hier_labels
 from s2s_ft.modeling import BertForSequenceToSequence, BertForSequenceToSequenceWithPseudoMask, BertForSequenceToSequenceUniLMV1
 from transformers import get_linear_schedule_with_warmup
 from transformers import BertConfig, BertTokenizer
 
 from s2s_ft import utils
 from s2s_ft.config import BertForSeq2SeqConfig
+from test import main as test_main
 
 LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
 logger = logging.getLogger(__name__)
@@ -122,7 +125,7 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
     torch.save(init_label_emb.cpu(), 'after.pt')
     return init_label_emb
 
-def prepare_for_training(args, model: torch.nn.Module, checkpoint_state_dict, amp):
+def prepare_for_training(args, model: torch.nn.Module, checkpoint_state_dict):
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
@@ -135,11 +138,11 @@ def prepare_for_training(args, model: torch.nn.Module, checkpoint_state_dict, am
         optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
         model.load_state_dict(checkpoint_state_dict['model'])
 
-    # multi-gpu training (should be after apex fp16 initialization)
+    # multi-gpu training
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    # Distributed training (should be after apex fp16 initialization)
+    # Distributed training
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
@@ -149,16 +152,6 @@ def prepare_for_training(args, model: torch.nn.Module, checkpoint_state_dict, am
 
 def train(args, training_features, model, tokenizer):
     """ Train the model """
-    if args.local_rank in [-1, 0] and args.log_dir:
-        raise NotImplementedError("SummaryWriter should be implemented")
-    else:
-        tb_writer = None
-
-    if args.fp16:
-        raise NotImplementedError("Apex is not used.")
-    else:
-        amp = None
-
     # model recover
     recover_step = utils.get_max_epoch_model(args.output_dir)
     checkpoint_state_dict = None
@@ -166,7 +159,7 @@ def train(args, training_features, model, tokenizer):
     assert isinstance(model, BertForSequenceToSequence)
     model.to(args.device)
     vocab_size = model.bert.embeddings.word_embeddings.num_embeddings  # Ini aman karena nilainya 30663 untuk WOS
-    model, optimizer = prepare_for_training(args, model, checkpoint_state_dict, amp=amp)
+    model, optimizer = prepare_for_training(args, model, checkpoint_state_dict)
 
     per_node_train_batch_size = args.per_gpu_train_batch_size * args.n_gpu * args.gradient_accumulation_steps
     train_batch_size = per_node_train_batch_size * (torch.distributed.get_world_size() if args.local_rank != -1 else 1)
@@ -214,6 +207,7 @@ def train(args, training_features, model, tokenizer):
             logger.info("Target tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(target_ids)))
 
     logger.info("Mode = %s" % str(model))
+    input("Check if the debug is expected. (ENTER)")
 
     # Train!
     logger.info("  ***** Running training *****  *")
@@ -325,8 +319,6 @@ def train(args, training_features, model, tokenizer):
                     torch.save(optim_to_save, os.path.join(save_path, utils.OPTIM_NAME))
                     logger.info("Saving model checkpoint %d into %s", global_step, save_path)
 
-                    from test import main
-
                     flags = ['--model_type'     , args.model_type                          ,
                     '--tokenizer_name'         , args.model_name_or_path             ,
                      '--input_file'             , args.valid_file                  ,
@@ -357,7 +349,7 @@ def train(args, training_features, model, tokenizer):
                     if args.model_type == 'roberta':
                         del flags[flags.index('--do_lower_case')]
 
-                    out = main(flags)
+                    out = test_main(flags)
                     assert out is not None
                     if args.wandb:
                         wandb.log({'eval/macro_f1': out['macro_f1'], 'eval/micro_f1': out['micro_f1']})
@@ -390,19 +382,13 @@ def train(args, training_features, model, tokenizer):
                             pass
                     print('best micro', best_micro_f1_path, best_micro_f1)
                     print('best macro', best_macro_f1_path, best_macro_f1)
-
-    if args.local_rank in [-1, 0] and tb_writer:
-        tb_writer.close()
+    
     return best_macro_f1_path, best_micro_f1_path
 
 
 def get_args():
     parser = argparse.ArgumentParser()
 
-    # parser.add_argument("--train_source_file", default=None, type=str, required=True,
-    #                     help="Training data contains source")
-    # parser.add_argument("--train_target_file", default=None, type=str, required=True,
-    #                     help="Training data contains target")
     parser.add_argument("--train_file", default=None, type=str, required=True,
                         help="Training data (json format) for training. Keys: source and target")
     parser.add_argument("--valid_file", default=None, type=str, required=True,
@@ -477,11 +463,6 @@ def get_args():
 
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="local_rank for distributed training on gpus")
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit")
-    parser.add_argument('--fp16_opt_level', type=str, default='O1',
-                        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
-                             "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
 
@@ -493,10 +474,6 @@ def get_args():
                         help="The number of the max masked tokens in target sequence")
     parser.add_argument('--mask_way', type=str, default='v2',
                         help="Fine-tuning method (v0: position shift, v1: masked LM, v2: pseudo-masking)")
-    parser.add_argument("--lmdb_cache", action='store_true',
-                        help="Use LMDB to cache training features")
-    parser.add_argument("--lmdb_dtype", type=str, default='h',
-                        help="Data type for cached data type for LMDB")
 
     parser.add_argument("--add_vocab_file", type=str, default=None)
     parser.add_argument('--wandb', action='store_true')
@@ -548,8 +525,8 @@ def prepare(args):
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-                   args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s",
+                   args.local_rank, device, args.n_gpu, bool(args.local_rank != -1))
 
     # Set seed
     random.seed(args.seed)
@@ -560,15 +537,47 @@ def prepare(args):
 
     logger.info("Training/evaluation parameters %s", args)
 
-    # Before we do anything with models, we want to ensure that we get fp16 execution of torch.einsum if args.fp16 is set.
-    # Otherwise it'll default to "promote" mode, and we'll get fp32 operations. Note that running `--fp16_opt_level="O2"` will
-    # remove the need for this code, but it is still valid.
-    if args.fp16:
-        raise ValueError("No Apex plz")
-
 
 def get_model_and_tokenizer(args):
     config_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    config = prepare_config(args, config_class)
+    prev_vs = config.vocab_size
+
+    tokenizer = prepare_tokenizer(args, tokenizer_class)
+
+    model_class = \
+        BertForSequenceToSequenceWithPseudoMask if args.mask_way == 'v2' \
+            else BertForSequenceToSequenceUniLMV1
+
+    logger.info("Construct model %s" % model_class.MODEL_NAME)
+
+    model = prepare_model(args, config, model_class)
+
+    if args.add_vocab_file:
+        # Notice that the config will change
+        expand_vocab(args, config, tokenizer, model)
+
+    if args.soft_label:
+        setup_soft_label_to_model(tokenizer, model, config.vocab_size)
+
+    model.tie_weights()
+    return model, tokenizer, prev_vs
+
+def prepare_model(args, config, model_class):
+    model = model_class.from_pretrained(
+        args.model_name_or_path, config=config,
+        cache_dir=args.cache_dir if args.cache_dir else None)
+        
+    return model
+
+def prepare_tokenizer(args, tokenizer_class):
+    tokenizer = tokenizer_class.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+        do_lower_case=args.do_lower_case, cache_dir=args.cache_dir if args.cache_dir else None)
+        
+    return tokenizer
+
+def prepare_config(args, config_class):
     model_config = config_class.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
         cache_dir=args.cache_dir if args.cache_dir else None)
@@ -578,93 +587,34 @@ def get_model_and_tokenizer(args):
         max_position_embeddings=args.max_source_seq_length + args.max_target_seq_length)
 
     logger.info("Model config for seq2seq: %s", str(config))
+    return config
 
-    tokenizer = tokenizer_class.from_pretrained(
-        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-        do_lower_case=args.do_lower_case, cache_dir=args.cache_dir if args.cache_dir else None)
+def setup_soft_label_to_model(tokenizer, model, vs):
+    assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
+    model.soft_label = True
+    model.mask_token_id = tokenizer.mask_token_id
+    model.sep_token_id = tokenizer.sep_token_id
+    model.vs = vs
 
-    model_class = \
-        BertForSequenceToSequenceWithPseudoMask if args.mask_way == 'v2' \
-            else BertForSequenceToSequenceUniLMV1
+def expand_vocab(args, config, tokenizer, model):
+    with open(args.add_vocab_file, 'rb') as f:
+        label_map = pickle.load(f)
+    label_tokens_start_index  = model.bert.embeddings.word_embeddings.num_embeddings
+    labels_key = list(label_map.keys())
+    label_name_tensors = []
+    max_l = -1
+    if args.rcv1_expand:
+        rcv1_label_expand = {}
+        for i in open(args.rcv1_expand):
+            oi = [j for j in i.replace('\n', '').split(' ') if len(j) > 0]
+            rcv1_label_expand[oi[3]] = i.split('child-description: ')[-1].lower().replace('\n', '')
 
-    logger.info("Construct model %s" % model_class.MODEL_NAME)
-
-    model = model_class.from_pretrained(
-        args.model_name_or_path, config=config,
-        cache_dir=args.cache_dir if args.cache_dir else None)
-
-    if args.add_vocab_file:
-        import pickle
-        with open(args.add_vocab_file, 'rb') as f:
-            label_map = pickle.load(f)
-        label_tokens_start_index  = model.bert.embeddings.word_embeddings.num_embeddings
-        labels_key = list(label_map.keys())
-        label_name_tensors = []
-        max_l = -1
-        if args.rcv1_expand:
-            rcv1_label_expand = {}
-            for i in open(args.rcv1_expand):
-                oi = [j for j in i.replace('\n', '').split(' ') if len(j) > 0]
-                rcv1_label_expand[oi[3]] = i.split('child-description: ')[-1].lower().replace('\n', '')
-
-        for lk in labels_key:
-            if args.one_by_one_label_init_map:
-                from collections import defaultdict
-                hiera = defaultdict(set)
-                _label_dict = {}
-                with open(args.one_by_one_label_init_map) as f:
-                    _label_dict['Root'] = -1
-                    for line in f.readlines():
-                        line = line.strip().split('\t')
-                        for i in line[1:]:
-                            if i not in _label_dict:
-                                _label_dict[i] = len(_label_dict) - 1
-                            hiera[line[0]].add(i)
-                    _label_dict.pop('Root')
-
-                r_hiera = {}
-                for i in hiera:
-                    for j in list(hiera[i]):
-                        r_hiera[j] = i
-
-                def _loop(a):
-                    if r_hiera[a] != 'Root':
-                        return [a,] + _loop(r_hiera[a])
-                    else:
-                        return [a]
-
-                one_by_one_label_init_map = {}
-                for i in _label_dict:
-                    one_by_one_label_init_map[i] = '/'.join(_loop(i)[::-1])
-                print(f'map {lk} to {one_by_one_label_init_map[lk]}')
-                label_name_tensors.append(tokenizer.encode(one_by_one_label_init_map[lk], add_special_tokens=False))
-            elif args.nyt_only_last_label_init:
-                print(f'map {lk} to {lk.split("/")[-1]}')
-                label_name_tensors.append(tokenizer.encode(lk.split("/")[-1], add_special_tokens=False))
-            elif args.rcv1_expand:
-                print(f'map {lk} to {rcv1_label_expand[lk]}')
-                label_name_tensors.append(tokenizer.encode(rcv1_label_expand[lk], add_special_tokens=False))
-            else:
-                label_name_tensors.append(tokenizer.encode(lk, add_special_tokens=False))
-            max_l = max(len(label_name_tensors[-1]), max_l)
-        label_name_tensors = torch.LongTensor([i + [tokenizer.pad_token_id] * (max_l - len(i)) for i in label_name_tensors])
-
-        with torch.no_grad():
-            init_label_emb = model.bert.embeddings.word_embeddings(label_name_tensors)
-            label_mask = label_name_tensors != tokenizer.pad_token_id
-            init_label_emb = (label_mask.unsqueeze(-1) * init_label_emb).sum(1)
-        label_tokens = [i for i in range(len(label_map))]
-        tokenizer.add_tokens([label_map[label] for label in labels_key])
-        #import pdb;pdb.set_trace()
-        #labels_embeds = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
-        if args.label_cpt:
-            # for compare with same seed
-            rng_state = torch.get_rng_state()
-
+    for lk in labels_key:
+        if args.one_by_one_label_init_map:
             from collections import defaultdict
             hiera = defaultdict(set)
             _label_dict = {}
-            with open(args.label_cpt) as f:
+            with open(args.one_by_one_label_init_map) as f:
                 _label_dict['Root'] = -1
                 for line in f.readlines():
                     line = line.strip().split('\t')
@@ -673,6 +623,7 @@ def get_model_and_tokenizer(args):
                             _label_dict[i] = len(_label_dict) - 1
                         hiera[line[0]].add(i)
                 _label_dict.pop('Root')
+
             r_hiera = {}
             for i in hiera:
                 for j in list(hiera[i]):
@@ -684,65 +635,120 @@ def get_model_and_tokenizer(args):
                 else:
                     return [a]
 
-            label_class = {}
+            one_by_one_label_init_map = {}
             for i in _label_dict:
-                label_class[i] = len(_loop(i))
-            # cls l1 l2 l3 sep
-            attention_mask = torch.zeros((len(label_tokens) + 2, len(label_tokens) + 2))
-            num_hiers = defaultdict(set)
-            reversed_hiers = {}
-            for hi in hiera:
-                for hj in list(hiera[hi]):
-                    def _label_map_f(x):
-                        if x == 'Root': return -1
-                        return int(label_map[x].replace('[A_', '').replace(']', ''))
-                    attention_mask[_label_map_f(hi) + 1][_label_map_f(hj) + 1] = 1
-                    num_hiers[_label_map_f(hi) + 1].add(_label_map_f(hj) + 1)
-                    reversed_hiers[_label_map_f(hj) + 1] = _label_map_f(hi) + 1
-                    if args.label_cpt_use_bce:
-                        attention_mask[_label_map_f(hj) + 1][_label_map_f(hi) + 1] = 1
-            input_ids = torch.LongTensor(tokenizer.encode(' '.join(label_map.values()).lower()))
-            assert len(input_ids) == len(labels_key) + 2
-            position_ids = torch.LongTensor([0, ] + [label_class[i] for i in labels_key] + [max(label_class.values()) + 1,])
+                one_by_one_label_init_map[i] = '/'.join(_loop(i)[::-1])
+            print(f'map {lk} to {one_by_one_label_init_map[lk]}')
+            label_name_tensors.append(tokenizer.encode(one_by_one_label_init_map[lk], add_special_tokens=False))
+        elif args.nyt_only_last_label_init:
+            print(f'map {lk} to {lk.split("/")[-1]}')
+            label_name_tensors.append(tokenizer.encode(lk.split("/")[-1], add_special_tokens=False))
+        elif args.rcv1_expand:
+            print(f'map {lk} to {rcv1_label_expand[lk]}')
+            label_name_tensors.append(tokenizer.encode(rcv1_label_expand[lk], add_special_tokens=False))
+        else:
+            label_name_tensors.append(tokenizer.encode(lk, add_special_tokens=False))
+        max_l = max(len(label_name_tensors[-1]), max_l)
+    label_name_tensors = torch.LongTensor([i + [tokenizer.pad_token_id] * (max_l - len(i)) for i in label_name_tensors])
 
-            init_label_emb = training_cpt(args, tokenizer, input_ids, attention_mask,
+    with torch.no_grad():
+        init_label_emb = model.bert.embeddings.word_embeddings(label_name_tensors)
+        label_mask = label_name_tensors != tokenizer.pad_token_id
+        init_label_emb = (label_mask.unsqueeze(-1) * init_label_emb).sum(1)
+    label_tokens = [i for i in range(len(label_map))]
+    tokenizer.add_tokens([label_map[label] for label in labels_key])
+
+    if args.label_cpt:
+            # for compare with same seed
+        rng_state = torch.get_rng_state()
+
+        from collections import defaultdict
+        hiera = defaultdict(set)
+        _label_dict = {}
+        with open(args.label_cpt) as f:
+            _label_dict['Root'] = -1
+            for line in f.readlines():
+                line = line.strip().split('\t')
+                for i in line[1:]:
+                    if i not in _label_dict:
+                        _label_dict[i] = len(_label_dict) - 1
+                    hiera[line[0]].add(i)
+            _label_dict.pop('Root')
+        r_hiera = {}
+        for i in hiera:
+            for j in list(hiera[i]):
+                r_hiera[j] = i
+
+        def _loop(a):
+            if r_hiera[a] != 'Root':
+                return [a,] + _loop(r_hiera[a])
+            else:
+                return [a]
+
+        label_class = {}
+        for i in _label_dict:
+            label_class[i] = len(_loop(i))
+            # cls l1 l2 l3 sep
+        attention_mask = torch.zeros((len(label_tokens) + 2, len(label_tokens) + 2))
+        num_hiers = defaultdict(set)
+        reversed_hiers = {}
+        for hi in hiera:
+            for hj in list(hiera[hi]):
+                def _label_map_f(x):
+                    if x == 'Root': return -1
+                    return int(label_map[x].replace('[A_', '').replace(']', ''))
+                attention_mask[_label_map_f(hi) + 1][_label_map_f(hj) + 1] = 1
+                num_hiers[_label_map_f(hi) + 1].add(_label_map_f(hj) + 1)
+                reversed_hiers[_label_map_f(hj) + 1] = _label_map_f(hi) + 1
+                if args.label_cpt_use_bce:
+                    attention_mask[_label_map_f(hj) + 1][_label_map_f(hi) + 1] = 1
+        input_ids = torch.LongTensor(tokenizer.encode(' '.join(label_map.values()).lower()))
+        assert len(input_ids) == len(labels_key) + 2
+        position_ids = torch.LongTensor([0, ] + [label_class[i] for i in labels_key] + [max(label_class.values()) + 1,])
+
+        init_label_emb = training_cpt(args, tokenizer, input_ids, attention_mask,
                                             position_ids, init_label_emb, num_hiers, reversed_hiers).detach().cpu()
 
             # for compare with same seed
-            torch.set_rng_state(rng_state)
-        elif args.random_label_init:
-            rng_state = torch.get_rng_state()
-            init_label_emb = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
-            torch.set_rng_state(rng_state)
+        torch.set_rng_state(rng_state)
+    elif args.random_label_init:
+        rng_state = torch.get_rng_state()
+        init_label_emb = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
+        torch.set_rng_state(rng_state)
 
-        model.bert.embeddings.word_embeddings.weight.data = torch.cat([model.bert.embeddings.word_embeddings.weight.data, init_label_emb], dim=0)
-        model.bert.embeddings.word_embeddings.num_embeddings += len(label_tokens)
-        model.cls.predictions.bias.data =  torch.cat([model.cls.predictions.bias.data, torch.zeros(len(label_tokens))],
+    model.bert.embeddings.word_embeddings.weight.data = torch.cat([model.bert.embeddings.word_embeddings.weight.data, init_label_emb], dim=0)
+    model.bert.embeddings.word_embeddings.num_embeddings += len(label_tokens)
+    model.cls.predictions.bias.data =  torch.cat([model.cls.predictions.bias.data, torch.zeros(len(label_tokens))],
                                                         dim=0)
-        vs = config.vocab_size
-        config.vocab_size = config.vocab_size + len(label_tokens)
-        if args.softmax_label_only:
-            assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
-            model.label_start_index = label_tokens_start_index
-    else:
-        vs = config.vocab_size
-
-    if args.soft_label:
+    
+    config.vocab_size = config.vocab_size + len(label_tokens)
+    if args.softmax_label_only:
         assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
-        model.soft_label = True
-        model.mask_token_id = tokenizer.mask_token_id
-        model.sep_token_id = tokenizer.sep_token_id
-        model.vs = vs
-
-    model.tie_weights()
-    return model, tokenizer, vs
+        model.label_start_index = label_tokens_start_index
 
 def test(args, best_macro_f1_path, best_micro_f1_path):
-    from test import main
     bout = None
     for i, save_path in enumerate([best_micro_f1_path, best_macro_f1_path]):
         if save_path is None: continue
-        flags = ['--model_type'     , args.model_type                          ,
+        flags = prepare_test_flags(args, save_path)
+
+        out = test_main(flags)
+        assert out is not None
+        if args.wandb:
+            prefix = 'test' + 'micro' if i == 0 else 'macro'
+            log_test_output_to_wandb(out, prefix)
+            if bout is None or bout['macro_f1'] < out['macro_f1']:
+                bout = out
+
+    if args.wandb and bout:
+        prefix = 'test'
+        log_test_output_to_wandb(bout, prefix)
+
+def log_test_output_to_wandb(out, prefix):
+    wandb.log({f'{prefix}/macro_f1': out['macro_f1'], f'{prefix}/micro_f1': out['micro_f1']})
+
+def prepare_test_flags(args, save_path):
+    flags = ['--model_type'     , args.model_type                          ,
             '--tokenizer_name'         , args.model_name_or_path             ,
             '--input_file'             , args.test_file                  ,
             '--split'                  , 'test'                         ,
@@ -759,31 +765,18 @@ def test(args, best_macro_f1_path, best_micro_f1_path):
             '--cached_features_file'   , str(os.path.join(args.output_dir, "cached_features_for_test.pt")),
             '--add_vocab_file'         , args.add_vocab_file]
 
-        if args.softmax_label_only:
-            flags.append('--softmax_label_only')
-        if args.soft_label:
-            flags.append('--soft_label')
-        if args.soft_label_hier_real:
-            flags.append('--soft_label_hier_real_with_train_file')
-            flags.append(args.train_file)
-        if args.model_type == 'roberta':
-            del flags[flags.index('--do_lower_case')]
-        if args.label_cpt_decodewithpos:
-            flags.append('--target_no_offset')
-
-        out = main(flags)
-        assert out is not None
-        prefix = 'test' + 'micro' if i == 0 else 'macro'
-        if args.wandb:
-            wandb.log({f'{prefix}/macro_f1': out['macro_f1'], f'{prefix}/micro_f1': out['micro_f1']})
-            if bout is None or bout['macro_f1'] < out['macro_f1']:
-                bout = out
-
-    if args.wandb and bout:
-        prefix = 'test'
-        wandb.log({f'{prefix}/macro_f1': bout['macro_f1'], f'{prefix}/micro_f1': bout['micro_f1']})
-
-
+    if args.softmax_label_only:
+        flags.append('--softmax_label_only')
+    if args.soft_label:
+        flags.append('--soft_label')
+    if args.soft_label_hier_real:
+        flags.append('--soft_label_hier_real_with_train_file')
+        flags.append(args.train_file)
+    if args.model_type == 'roberta':
+        del flags[flags.index('--do_lower_case')]
+    if args.label_cpt_decodewithpos:
+        flags.append('--target_no_offset')
+    return flags
 
 def main():
     args = get_args()
@@ -794,75 +787,63 @@ def main():
         exit(0)
 
     if args.wandb:
-        wandb.init(
-            project="HBGL",
-            name=args.output_dir.split('/')[-1],
-        )
-        wandb.define_metric("train/global_step")
-        wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
+        wandb_project_name = args.output_dir.split('/')[-1]
+        init_wandb(wandb_project_name)
 
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
         # Make sure only the first process in distributed training will download model & vocab
-    # Load pretrained model and tokenizer
-    model, tokenizer, vs = get_model_and_tokenizer(args)
+    
+    model, tokenizer, prev_vs = get_model_and_tokenizer(args)
 
     if args.local_rank == 0:
         torch.distributed.barrier()
         # Make sure only the first process in distributed training will download model & vocab
+    
+    if args.soft_label and args.soft_label_hier_real:
+        # Possibly unused?
+        setup_model_hier_labels(args.train_file, model, tokenizer)
 
-    if args.cached_train_features_file is None:
-        if not args.lmdb_cache:
-            args.cached_train_features_file = os.path.join(args.output_dir, "cached_features_for_training.pt")
-        else:
-            args.cached_train_features_file = os.path.join(args.output_dir, "cached_features_for_training_lmdb")
+    training_features = prepare_training_features(args, tokenizer)
 
-    if args.soft_label:
-        args.cached_train_features_file += 'soft_label'
-        # args.valid_file = args.valid_file.replace('generated', 'generated_tl')
-        #
-        if args.soft_label_hier_real:
-            hier_labels = None
-            for line in open(args.train_file):
-                if hier_labels:
-                    for i, l in enumerate(json.loads(line)['tgt']):
-                        hier_labels[i] |=  set(l)
-                else:
-                    hier_labels = [set(i) for i in json.loads(line)['tgt']]
-            assert hier_labels is not None
-            hier_labels = [tokenizer.convert_tokens_to_ids(list([j.lower() for j in i])) for i in hier_labels]
-
-            def to_multi_hot(label):
-                _label = torch.zeros(model.config.vocab_size)
-                for i in label:
-                    _label[i] = 1
-                return _label.bool()
-
-            model.hier_labels = [to_multi_hot(i) for i in hier_labels]
-            model.soft_label_hier_real = args.soft_label_hier_real
-
-
-    num_lines = sum(1 for line in open(args.train_file))
-    training_features = utils.load_and_cache_examples(
-        example_file=args.train_file, tokenizer=tokenizer, local_rank=args.local_rank,
-        cached_features_file=args.cached_train_features_file, shuffle=True,
-        lmdb_cache=args.lmdb_cache, lmdb_dtype=args.lmdb_dtype,
-        soft_label=args.soft_label,
-    )
-
-    # I have no idea what this assertion does.
-    # if args.add_vocab_file:
-    #     for i in training_features:
-    #         print(i.target_ids)
-    #         for j in i.target_ids:
-    #             print(args.soft_label)
-    #             if args.soft_label:
-    #                 for ji in j:
-    #                     assert ji >= vs
-
+    if args.add_vocab_file and args.soft_label:
+        assert_all_training_features_greater_or_equal_to_vocab_size(training_features, prev_vs)
+    
     best_macro_f1_path, best_micro_f1_path = train(args, training_features, model, tokenizer)
     if args.test_file:
         test(args, best_macro_f1_path, best_micro_f1_path)
+
+def prepare_training_features(args, tokenizer):
+    if args.cached_train_features_file is None:
+        cached_train_features_file = os.path.join(args.output_dir, "cached_features_for_training.pt")
+    else:
+        cached_train_features_file = args.cached_train_features_file
+
+    if args.soft_label:
+        cached_train_features_file += 'soft_label'
+    
+    training_features = utils.load_and_cache_examples(
+        example_file=args.train_file, tokenizer=tokenizer, local_rank=args.local_rank,
+        cached_features_file=cached_train_features_file, shuffle=True,
+        soft_label=args.soft_label,
+    )
+    
+    return training_features
+
+def assert_all_training_features_greater_or_equal_to_vocab_size(training_features, vs):
+    # This is to make sure that the vocab is added properly (and the training features are consistent)
+    for i in training_features:
+        for j in i.target_ids:
+            for ji in j:
+                assert ji >= vs, f"Expecting all target_ids >= vs ({vs}). Got: {i.target_ids}"
+
+def init_wandb(wandb_project_name):
+    wandb.init(
+            project="HBGL",
+            name=wandb_project_name,
+        )
+    wandb.define_metric("train/global_step")
+    wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
 
 
 if __name__ == "__main__":

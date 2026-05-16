@@ -380,7 +380,7 @@ def load_and_cache_examples_fast(
 
 def load_and_cache_examples(
         example_file, tokenizer, local_rank, cached_features_file, shuffle=True, 
-        lmdb_cache=None, lmdb_dtype='h', eval_mode=False, soft_label=False):
+        eval_mode=False, soft_label=False, use_tqdm=True):
     # Make sure only the first process in distributed training process the dataset, and the others will use the cache
     if local_rank not in [-1, 0]:
         torch.distributed.barrier()
@@ -404,13 +404,20 @@ def load_and_cache_examples(
         slc = collections.defaultdict(int)
         tlc = collections.defaultdict(int)
 
-        for example in tqdm.tqdm(examples):
+        if use_tqdm:
+            iter_examples = tqdm.tqdm(examples)
+        else:
+            iter_examples = examples
+        
+        for example in iter_examples:
             if soft_label:
                 source_tokens = tokenizer.tokenize(example["src"])
                 #target_tokens = [] if eval_mode else [tokenizer.tokenize(i) for i in example["tgt"]]
                 source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
-
-                target_ids = [tokenizer.convert_tokens_to_ids([j.lower() for j in i]) for i in example['tgt']]
+                
+                # I have no idea why the original need the .lower()
+                # target_ids = [tokenizer.convert_tokens_to_ids([j.lower() for j in i]) for i in example['tgt']]
+                target_ids = [tokenizer.convert_tokens_to_ids([j for j in i]) for i in example['tgt']]
 
             else:
                 if isinstance(example["src"], list):

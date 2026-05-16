@@ -16,6 +16,7 @@ import torch
 import random
 import pickle
 
+from run_test_utils import setup_model_hier_labels
 from s2s_ft.modeling_decoding import BertForSeq2SeqDecoder, BertConfig
 import s2s_ft.s2s_loader as seq2seq_loader
 from s2s_ft.utils import TrainingExample, load_and_cache_examples
@@ -67,8 +68,6 @@ def main(flags=None):
                             "than this will be padded.")
 
     # decoding parameters
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
     parser.add_argument('--no_cuda', action='store_true',
                         help="Whether to use CUDA for decoding")
     parser.add_argument("--input_file", type=str, help="Input file")
@@ -222,28 +221,9 @@ def main(flags=None):
             model.label_start_index = label_tokens_start_index
 
             if args.soft_label_hier_real_with_train_file:
-                hier_labels = None
-                for line in open(args.soft_label_hier_real_with_train_file):
-                    if hier_labels:
-                        for i, l in enumerate(json.loads(line)['tgt']):
-                            hier_labels[i] |=  set(l)
-                    else:
-                        hier_labels = [set(i) for i in json.loads(line)['tgt']]
-                assert hier_labels is not None
-                hier_labels = [tokenizer.convert_tokens_to_ids(list([j.lower() for j in i])) for i in hier_labels]
+                print("setup_model_hier_labels IS USED!")
+                setup_model_hier_labels(args.soft_label_hier_real_with_train_file, model, tokenizer)
 
-                def to_multi_hot(label):
-                    assert isinstance(model.config, BertConfig)
-                    _label = torch.zeros(model.config.vocab_size)
-                    for i in label:
-                        _label[i] = 1
-                    return _label.bool()
-
-                model.hier_labels = [to_multi_hot(i) for i in hier_labels]
-                model.soft_label_hier_real = True
-
-        if args.fp16:
-            model.half()
         model.to(device) # type: ignore # no idea why this is happening
         if n_gpu > 1:
             model = torch.nn.DataParallel(model)
@@ -255,7 +235,7 @@ def main(flags=None):
         if args.pos_shift:
             max_src_length += 1
 
-        num_lines = sum(1 for line in open(args.input_file))
+        num_lines = sum(1 for _ in open(args.input_file))
         if num_lines < 10000:
             to_pred = load_and_cache_examples(
                 args.input_file, tokenizer, local_rank=-1,
