@@ -5,6 +5,7 @@ import shutil
 import argparse
 import logging
 import os
+from collections import defaultdict
 import json
 import pickle
 import random
@@ -540,7 +541,7 @@ def prepare(args):
 def get_model_and_tokenizer(args):
     config_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = prepare_config(args, config_class)
-    prev_vs = config.vocab_size
+    text_vocab_size = config.vocab_size
 
     tokenizer = prepare_tokenizer(args, tokenizer_class)
 
@@ -557,10 +558,10 @@ def get_model_and_tokenizer(args):
         expand_vocab(args, config, tokenizer, model)
 
     if args.soft_label:
-        sync_model_args(tokenizer, model, config.vocab_size)
+        sync_model_args(config, tokenizer, model, text_vocab_size)
 
     model.tie_weights()
-    return model, tokenizer, prev_vs
+    return model, tokenizer, text_vocab_size
 
 def prepare_model(args, config, model_class):
     model = model_class.from_pretrained(
@@ -588,12 +589,13 @@ def prepare_config(args, config_class):
     logger.info("Model config for seq2seq: %s", str(config))
     return config
 
-def sync_model_args(tokenizer, model, vs):
+def sync_model_args(config, tokenizer, model, text_vocab_size):
     assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
+    model.config = config
     model.soft_label = True
     model.mask_token_id = tokenizer.mask_token_id
     model.sep_token_id = tokenizer.sep_token_id
-    model.vs = vs
+    model.text_vocab_size = text_vocab_size
 
 def expand_vocab(args, config, tokenizer, model):
     with open(args.add_vocab_file, 'rb') as f:
@@ -610,33 +612,13 @@ def expand_vocab(args, config, tokenizer, model):
 
     for lk in labels_key:
         if args.one_by_one_label_init_map:
-            from collections import defaultdict
-            hiera = defaultdict(set)
-            _label_dict = {}
-            with open(args.one_by_one_label_init_map) as f:
-                _label_dict['Root'] = -1
-                for line in f.readlines():
-                    line = line.strip().split('\t')
-                    for i in line[1:]:
-                        if i not in _label_dict:
-                            _label_dict[i] = len(_label_dict) - 1
-                        hiera[line[0]].add(i)
-                _label_dict.pop('Root')
-
-            r_hiera = {}
-            for i in hiera:
-                for j in list(hiera[i]):
-                    r_hiera[j] = i
-
-            def _loop(a):
-                if r_hiera[a] != 'Root':
-                    return [a,] + _loop(r_hiera[a])
-                else:
-                    return [a]
+            _, _label_dict, ancestor_path_fn = make_hiera_info_from_hierarchy_file(
+                args.one_by_one_label_init_map
+            )
 
             one_by_one_label_init_map = {}
             for i in _label_dict:
-                one_by_one_label_init_map[i] = '/'.join(_loop(i)[::-1])
+                one_by_one_label_init_map[i] = '/'.join(ancestor_path_fn(i)[::-1])
             print(f'map {lk} to {one_by_one_label_init_map[lk]}')
             label_name_tensors.append(tokenizer.encode(one_by_one_label_init_map[lk], add_special_tokens=False))
         elif args.nyt_only_last_label_init:
@@ -658,35 +640,16 @@ def expand_vocab(args, config, tokenizer, model):
     tokenizer.add_tokens([label_map[label] for label in labels_key])
 
     if args.label_cpt:
-            # for compare with same seed
+        # for compare with same seed
         rng_state = torch.get_rng_state()
 
-        from collections import defaultdict
-        hiera = defaultdict(set)
-        _label_dict = {}
-        with open(args.label_cpt) as f:
-            _label_dict['Root'] = -1
-            for line in f.readlines():
-                line = line.strip().split('\t')
-                for i in line[1:]:
-                    if i not in _label_dict:
-                        _label_dict[i] = len(_label_dict) - 1
-                    hiera[line[0]].add(i)
-            _label_dict.pop('Root')
-        r_hiera = {}
-        for i in hiera:
-            for j in list(hiera[i]):
-                r_hiera[j] = i
-
-        def _loop(a):
-            if r_hiera[a] != 'Root':
-                return [a,] + _loop(r_hiera[a])
-            else:
-                return [a]
+        hiera, _label_dict, ancestor_path_fn = make_hiera_info_from_hierarchy_file(
+            args.label_cpt
+        )
 
         label_class = {}
         for i in _label_dict:
-            label_class[i] = len(_loop(i))
+            label_class[i] = len(ancestor_path_fn(i))
             # cls l1 l2 l3 sep
         attention_mask = torch.zeros((len(label_tokens) + 2, len(label_tokens) + 2))
         num_hiers = defaultdict(set)
@@ -721,9 +684,36 @@ def expand_vocab(args, config, tokenizer, model):
                                                         dim=0)
     
     config.vocab_size = config.vocab_size + len(label_tokens)
+    config.vocab_size_or_config_json_file = config.vocab_size
     if args.softmax_label_only:
         assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
         model.label_start_index = label_tokens_start_index
+
+def make_hiera_info_from_hierarchy_file(label_filepath):
+    hiera = defaultdict(set)
+    _label_dict = {}
+    with open(label_filepath) as f:
+        _label_dict['Root'] = -1
+        for line in f.readlines():
+            line = line.strip().split('\t')
+            for i in line[1:]:
+                if i not in _label_dict:
+                    _label_dict[i] = len(_label_dict) - 1
+                hiera[line[0]].add(i)
+        _label_dict.pop('Root')
+
+    r_hiera = {}
+    for i in hiera:
+        for j in list(hiera[i]):
+            r_hiera[j] = i
+
+    def _ancestor_path_fn(a):
+        if r_hiera[a] != 'Root':
+            return [a,] + _ancestor_path_fn(r_hiera[a])
+        else:
+            return [a]
+    
+    return hiera, _label_dict, _ancestor_path_fn
 
 def test(args, best_macro_f1_path, best_micro_f1_path):
     bout = None

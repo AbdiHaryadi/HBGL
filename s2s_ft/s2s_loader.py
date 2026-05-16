@@ -28,26 +28,6 @@ def batch_list_to_batch_tensors(batch):
     return batch_tensors
 
 
-def _get_word_split_index(tokens, st, end):
-    split_idx = []
-    i = st
-    while i < end:
-        if (not tokens[i].startswith('##')) or (i == st):
-            split_idx.append(i)
-        i += 1
-    split_idx.append(end)
-    return split_idx
-
-
-def _expand_whole_word(tokens, st, end):
-    new_st, new_end = st, end
-    while (new_st >= 0) and tokens[new_st].startswith('##'):
-        new_st -= 1
-    while (new_end < len(tokens)) and tokens[new_end].startswith('##'):
-        new_end += 1
-    return new_st, new_end
-
-
 class Pipeline():
     """ Pre-process Pipeline Class : callable """
 
