@@ -207,7 +207,6 @@ def train(args, training_features, model, tokenizer):
             logger.info("Target tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(target_ids)))
 
     logger.info("Mode = %s" % str(model))
-    input("Check if the debug is expected. (ENTER)")
 
     # Train!
     logger.info("  ***** Running training *****  *")
@@ -558,7 +557,7 @@ def get_model_and_tokenizer(args):
         expand_vocab(args, config, tokenizer, model)
 
     if args.soft_label:
-        setup_soft_label_to_model(tokenizer, model, config.vocab_size)
+        sync_model_args(tokenizer, model, config.vocab_size)
 
     model.tie_weights()
     return model, tokenizer, prev_vs
@@ -589,7 +588,7 @@ def prepare_config(args, config_class):
     logger.info("Model config for seq2seq: %s", str(config))
     return config
 
-def setup_soft_label_to_model(tokenizer, model, vs):
+def sync_model_args(tokenizer, model, vs):
     assert isinstance(model, BertForSequenceToSequenceWithPseudoMask)
     model.soft_label = True
     model.mask_token_id = tokenizer.mask_token_id
