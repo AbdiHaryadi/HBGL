@@ -1,9 +1,5 @@
 """BERT finetuning runner."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 import json
 import glob
@@ -16,10 +12,11 @@ import torch
 import random
 import pickle
 
+from eval import evaluate
 from run_test_utils import setup_model_hier_labels
 from s2s_ft.modeling_decoding import BertForSeq2SeqDecoder, BertConfig
 import s2s_ft.s2s_loader as seq2seq_loader
-from s2s_ft.utils import TrainingExample, load_and_cache_examples
+from s2s_ft.utils import TrainingExample, load_and_cache_examples, load_and_cache_examples_fast
 from transformers import BertTokenizer
 
 TOKENIZER_CLASSES = {
@@ -148,7 +145,6 @@ def main(flags=None):
         cache_dir=args.cache_dir if args.cache_dir else None)
 
     if args.add_vocab_file:
-        import pickle
         with open(args.add_vocab_file, 'rb') as f:
             label_map = pickle.load(f)
         labels_key = list(label_map.keys())
@@ -195,8 +191,12 @@ def main(flags=None):
         config = BertConfig.from_json_file(config_file)
 
         bi_uni_pipeline = []
+        
+        vocab_words = [(token, token_id) for token, token_id in vocab.items()]
+        vocab_words.sort(key=lambda x: x[1])
+        vocab_words = [token for token, _ in vocab_words]
         bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seqDecoder(
-            list(vocab.keys()), tokenizer.convert_tokens_to_ids, args.max_seq_length,
+            vocab_words, tokenizer.convert_tokens_to_ids, args.max_seq_length,
             max_tgt_length=args.max_tgt_length, pos_shift=args.pos_shift,
             source_type_id=config.source_type_id, target_type_id=config.target_type_id,
             cls_token=tokenizer.cls_token, sep_token=tokenizer.sep_token, pad_token=tokenizer.pad_token))
@@ -208,18 +208,14 @@ def main(flags=None):
             forbid_duplicate_ngrams=args.forbid_duplicate_ngrams, forbid_ignore_set=forbid_ignore_set,
             ngram_size=args.ngram_size, min_len=args.min_len, mode=args.mode,
             pos_shift=args.pos_shift,
-            ignore_mismatched_sizes=True  # Remember that the model changed because of label embedding?
         )
 
-        if args.softmax_label_only and args.add_vocab_file:
+        if (args.softmax_label_only and args.add_vocab_file) or args.soft_label:
             label_tokens_start_index = model.bert.embeddings.word_embeddings.num_embeddings - add_token_num
             model.label_start_index = label_tokens_start_index
 
         if args.soft_label:
             model.soft_label = args.soft_label
-            label_tokens_start_index = model.bert.embeddings.word_embeddings.num_embeddings - add_token_num
-            model.label_start_index = label_tokens_start_index
-
             if args.soft_label_hier_real_with_train_file:
                 print("setup_model_hier_labels IS USED!")
                 setup_model_hier_labels(args.soft_label_hier_real_with_train_file, model, tokenizer)
@@ -241,7 +237,6 @@ def main(flags=None):
                 args.input_file, tokenizer, local_rank=-1,
                 cached_features_file=args.cached_features_file, shuffle=False, eval_mode=True)
         else:
-            from s2s_ft.utils import load_and_cache_examples_fast
             to_pred = load_and_cache_examples_fast(
                 args.input_file, tokenizer, local_rank=-1,
                 cached_features_file=args.cached_features_file, shuffle=False, eval_mode=True)
@@ -315,8 +310,6 @@ def main(flags=None):
                 fout.write(l)
                 fout.write("\n")
 
-        import pickle
-        from eval import evaluate
         def token_to_id(token):
             token = token.lower()
             try:
